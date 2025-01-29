@@ -1,241 +1,127 @@
-"""Network scanner for detecting streaming URLs."""
+"""Network scanner for detecting video streaming URLs."""
 import asyncio
 import aiohttp
-import websockets
 from typing import Set, Dict, List
 import logging
 from protocols import (
     get_protocol_ports, is_streaming_url, COMMON_STREAMING_PORTS,
-    validate_protocol_response, get_protocol_timeout
+    validate_protocol_response, get_protocol_timeout, is_video_content_type
 )
 from utils import check_port, probe_url, get_network_range
 from asyncio import Semaphore
+import time
+import websockets
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class StreamScanner:
-    def __init__(self, max_concurrent_hosts: int = 10):  # Reduced concurrent hosts for mobile
+    def __init__(self, max_concurrent_hosts: int = 5):  # Reduced for mobile devices
         self.discovered_streams: Set[str] = set()
+        self.active_streams: Dict[str, Dict] = {}  # Track active streams
         self.scan_count = 0
         self.total_hosts = 0
         self.host_semaphore = Semaphore(max_concurrent_hosts)
-        self.session_timeout = aiohttp.ClientTimeout(total=120)  # Increased total timeout
+        self.session_timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
         self.successful_scans = 0
         self.failed_scans = 0
-        self.retry_count = 3
-        self.protocol_timeouts = {
-            'rtsp': 8.0,
-            'hls': 10.0,
-            'dash': 10.0,
-            'rtmp': 8.0,
-            'http': 10.0,
-            'https': 10.0,
-            'ws': 8.0,
-            'wss': 8.0
-        }
+        self.retry_count = 5  # Increased retries
 
-    async def check_ws_stream(self, ip: str, port: int) -> List[str]:
-        """Check for WebSocket streaming endpoints."""
-        streams = []
-        paths = [
-            'ws', 'stream', 'live', 'video', 'media',
-            'mobile/stream', 'mobile/live', 'app/stream'
-        ]
-
-        for path in paths:
-            for protocol in ['ws', 'wss']:
-                url = f"{protocol}://{ip}:{port}/{path}"
+    async def verify_active_stream(self, url: str, session: aiohttp.ClientSession) -> bool:
+        """Verify if a stream is currently active by checking for video content."""
+        try:
+            # Try multiple times with increased timeout
+            for attempt in range(3):
                 try:
-                    async with websockets.connect(url, timeout=8) as ws:
-                        try:
-                            await ws.send('{"type":"subscribe"}')
-                            data = await asyncio.wait_for(ws.recv(), timeout=2)
-                            if data:  # Any response might indicate a stream
-                                streams.append(url)
-                                logger.info(f"Found WebSocket stream: {url}")
-                        except asyncio.TimeoutError:
-                            continue
-                except Exception as e:
-                    logger.debug(f"WebSocket connection failed for {url}: {e}")
-                    await asyncio.sleep(0.5)
-        return streams
+                    timeout = aiohttp.ClientTimeout(total=20)  # Increased timeout for mobile networks
+                    async with session.get(url, timeout=timeout) as response:
+                        if response.status == 200:
+                            # Read larger initial chunk to verify video content
+                            chunk = await response.content.read(16384)  # Increased chunk size
+                            content_type = response.headers.get('content-type', '')
 
-    async def check_mobile_stream(self, ip: str, port: int, session: aiohttp.ClientSession) -> List[str]:
-        """Check for mobile-specific streaming endpoints."""
-        streams = []
-        paths = [
-            'mobile/stream', 'mobile/live', 'mobile/hls',
-            'mobile/dash', 'app/stream', 'app/live',
-            'm/stream', 'm/live', 'api/stream', 'api/live'
+                            # Check both content type and data for video signatures
+                            if is_video_content_type(content_type) or validate_protocol_response(chunk, 'video'):
+                                # Save stream metadata with more details
+                                self.active_streams[url] = {
+                                    'first_seen': time.time(),
+                                    'last_active': time.time(),
+                                    'content_type': content_type,
+                                    'size': len(chunk),
+                                    'headers': dict(response.headers),
+                                    'status': 'active'
+                                }
+                                return True
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.debug(f"Attempt {attempt + 1} failed for {url}: {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+        except Exception as e:
+            logger.debug(f"Error verifying stream {url}: {e}")
+        return False
+
+    async def scan_mobile_ports(self, ip: str, session: aiohttp.ClientSession) -> List[str]:
+        """Scan ports commonly used by mobile streaming apps."""
+        mobile_streams = []
+        mobile_ports = [8080, 8000, 8888, 9000, 8081, 8082, 8083, 8084, 8085]  # Extended mobile ports
+        mobile_paths = [
+            'mobile/stream', 'mobile/live', 'mobile/video',
+            'app/stream', 'app/live', 'app/video',
+            'stream/mobile', 'live/mobile', 'video/mobile',
+            'm/stream', 'm/live', 'm/video',
+            'streaming', 'streams', 'videos',
+            'cast', 'casting', 'screen'
         ]
 
-        for path in paths:
-            url = f"http://{ip}:{port}/{path}"
-            if await probe_url(url, session):
-                streams.append(url)
-                logger.info(f"Found mobile stream: {url}")
-        return streams
+        for port in mobile_ports:
+            if await check_port(ip, port, timeout=5.0):
+                for path in mobile_paths:
+                    for protocol in ['http', 'https']:
+                        url = f"{protocol}://{ip}:{port}/{path}"
+                        if await self.verify_active_stream(url, session):
+                            mobile_streams.append(url)
+                            logger.info(f"Found mobile stream: {url}")
 
-    async def check_rtsp(self, ip: str, port: int) -> List[str]:
-        """Check for RTSP streams with mobile paths."""
-        streams = []
-        common_paths = [
-            'live', 'stream', 'cam', 'video0', 'video1',
-            'h264', 'mpeg4', 'media', 'videoMain',
-            'video1+audio1', 'primary', 'track1',
-            'ch01', 'ch1', 'sub', 'main', 'av0_0',
-            'mobile/stream', 'mobile/live', 'app/stream'
-        ]
-        timeout = self.protocol_timeouts['rtsp']
-
-        for path in common_paths:
-            url = f"rtsp://{ip}:{port}/{path}"
-            for attempt in range(self.retry_count):
-                try:
-                    reader, writer = await asyncio.open_connection(ip, port)
-                    writer.write(f"OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode())
-                    await writer.drain()
-
-                    try:
-                        data = await asyncio.wait_for(reader.read(1024), timeout=timeout)
-                        if b"RTSP/1.0 200" in data or b"RTSP/1.1 200" in data:
-                            streams.append(url)
-                            logger.info(f"Found RTSP stream: {url}")
-                            break
-                    except asyncio.TimeoutError:
-                        logger.debug(f"RTSP timeout for {url}")
-                    finally:
-                        writer.close()
-                        await writer.wait_closed()
-                        await asyncio.sleep(1)
-                except (ConnectionRefusedError, OSError) as e:
-                    logger.debug(f"RTSP connection failed for {url}: {e}")
-                    await asyncio.sleep(1)
-        return streams
-
-    async def check_hls(self, ip: str, port: int, session: aiohttp.ClientSession) -> List[str]:
-        """Check for HLS streams on the given IP and port with retries."""
-        streams = []
-        paths = [
-            'hls', 'live', 'stream', 'streaming', 'playlist', 'channel',
-            'live/stream', 'live/channel1', 'video', 'media', 'content',
-            'stream1', 'stream2', 'ch1', 'ch2', 'feed1', 'feed2'
-        ]
-        timeout = aiohttp.ClientTimeout(total=self.protocol_timeouts['hls'])
-
-        for path in paths:
-            variants = [f"{path}/index.m3u8", f"{path}/playlist.m3u8", f"{path}/master.m3u8"]
-            for variant in variants:
-                url = f"http://{ip}:{port}/{variant}"
-                for attempt in range(self.retry_count):
-                    try:
-                        async with session.get(url, timeout=timeout) as response:
-                            if response.status == 200:
-                                text = await response.text()
-                                if '#EXTM3U' in text:
-                                    streams.append(url)
-                                    logger.info(f"Found HLS stream: {url}")
-                                    break
-                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                        logger.debug(f"HLS check failed for {url}: {e}")
-                        await asyncio.sleep(1)
-        return streams
-
-    async def check_dash(self, ip: str, port: int, session: aiohttp.ClientSession) -> List[str]:
-        """Check for DASH streams on the given IP and port with retries."""
-        streams = []
-        paths = [
-            'dash', 'stream', 'live', 'content', 'media', 'channel',
-            'video', 'streaming', 'manifest', 'mpd', 'output'
-        ]
-        timeout = aiohttp.ClientTimeout(total=self.protocol_timeouts['dash'])
-
-        for path in paths:
-            variants = [f"{path}/manifest.mpd", f"{path}/stream.mpd", f"{path}/index.mpd"]
-            for variant in variants:
-                url = f"http://{ip}:{port}/{variant}"
-                for attempt in range(self.retry_count):
-                    try:
-                        async with session.get(url, timeout=timeout) as response:
-                            if response.status == 200:
-                                text = await response.text()
-                                if '<MPD' in text:
-                                    streams.append(url)
-                                    logger.info(f"Found DASH stream: {url}")
-                                    break
-                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                        logger.debug(f"DASH check failed for {url}: {e}")
-                        await asyncio.sleep(1)
-        return streams
-
-    async def check_http_stream(self, ip: str, port: int, protocol: str, session: aiohttp.ClientSession) -> List[str]:
-        """Check for HTTP/HTTPS video streams."""
-        paths = ['stream', 'live', 'hls', 'dash', 'channel', 'video']
-        streams = []
-
-        for path in paths:
-            url = f"{protocol}://{ip}:{port}/{path}"
-            if await probe_url(url, session):
-                streams.append(url)
-                logger.info(f"Found {protocol.upper()} stream: {url}")
-
-        return streams
-
-    async def check_rtmp(self, ip: str, port: int) -> List[str]:
-        """Check for RTMP streams on the given IP and port with retries."""
-        streams = []
-        if await check_port(ip, port, timeout=self.protocol_timeouts['rtmp']):
-            paths = [
-                'live', 'stream', 'app', 'broadcast', 'channel',
-                'streaming', 'live/stream', 'media', 'content'
-            ]
-            for path in paths:
-                url = f"rtmp://{ip}:{port}/{path}"
-                streams.append(url)
-                logger.info(f"Found potential RTMP endpoint: {url}")
-                await asyncio.sleep(0.5)
-        return streams
+        return mobile_streams
 
     async def scan_host(self, ip: str, session: aiohttp.ClientSession) -> None:
-        """Scan a single host for streaming URLs with improved mobile support."""
+        """Scan a single host for active video streaming URLs."""
         try:
             async with self.host_semaphore:
                 all_streams = []
 
-                # Check all protocols including WebSocket and mobile-specific endpoints
+                # First check mobile streaming
+                mobile_streams = await self.scan_mobile_ports(ip, session)
+                if mobile_streams:
+                    all_streams.extend(mobile_streams)
+                    self.successful_scans += 1
+
+                # Then check standard protocols
                 for protocol, ports in COMMON_STREAMING_PORTS.items():
                     for port in ports:
-                        await asyncio.sleep(0.5)  # Increased delay for mobile networks
-                        if await check_port(ip, port, timeout=5.0):  # Increased timeout
-                            try:
+                        await asyncio.sleep(1)  # Rate limiting
+                        try:
+                            if await check_port(ip, port, timeout=5.0):
                                 streams = []
                                 if protocol == 'rtsp':
                                     streams = await self.check_rtsp(ip, port)
-                                elif protocol == 'ws' or protocol == 'wss':
-                                    streams = await self.check_ws_stream(ip, port)
-                                elif protocol in ['http', 'https']:
-                                    # Check both regular and mobile streams
-                                    http_streams = await self.check_http_stream(ip, port, protocol, session)
-                                    mobile_streams = await self.check_mobile_stream(ip, port, session)
-                                    streams = http_streams + mobile_streams
                                 elif protocol == 'hls':
                                     streams = await self.check_hls(ip, port, session)
-                                elif protocol == 'dash':
-                                    streams = await self.check_dash(ip, port, session)
                                 elif protocol == 'rtmp':
-                                    streams = await self.check_rtmp(ip, port)
-                                else:
-                                    continue
+                                    continue  # Skip RTMP for now
+                                elif protocol in ['http', 'https']:
+                                    video_paths = ['video', 'stream', 'live', 'content']
+                                    for path in video_paths:
+                                        url = f"{protocol}://{ip}:{port}/{path}"
+                                        if await self.verify_active_stream(url, session):
+                                            streams.append(url)
 
                                 if streams:
                                     all_streams.extend(streams)
                                     self.successful_scans += 1
-
-                            except Exception as e:
-                                logger.error(f"Error checking {protocol} on {ip}:{port}: {e}")
-                                self.failed_scans += 1
-                                continue
+                        except Exception as e:
+                            logger.error(f"Error checking {protocol} on {ip}:{port}: {e}")
+                            continue
 
                 if all_streams:
                     self.discovered_streams.update(all_streams)
@@ -254,7 +140,7 @@ class StreamScanner:
               f"[Success: {self.successful_scans}, Failed: {self.failed_scans}]", end="")
 
     async def scan_network(self) -> Set[str]:
-        """Scan the local network for streaming URLs with extended timeouts."""
+        """Scan the local network for active video streaming URLs."""
         network_range = get_network_range()
         self.total_hosts = len(network_range)
 
@@ -265,10 +151,85 @@ class StreamScanner:
         async with aiohttp.ClientSession(timeout=self.session_timeout) as session:
             tasks = []
             for ip in network_range:
-                tasks.append(self.scan_host(ip, session))
-                await asyncio.sleep(0.2)  # Add delay between creating tasks
+                task = asyncio.create_task(self.scan_host(ip, session))
+                tasks.append(task)
+                await asyncio.sleep(0.5)  # Rate limiting
 
             await asyncio.gather(*tasks)
             print("\nScan completed!")
 
         return self.discovered_streams
+
+    async def check_rtsp(self, ip: str, port: int) -> List[str]:
+        """Check for RTSP video streams with common paths."""
+        streams = []
+        video_paths = [
+            'video', 'live', 'stream', 'cam',
+            'video0', 'video1', 'h264', 'mpeg4',
+            'media', 'videoMain', 'channel1',
+            'ch01', 'ch1', 'main',
+            'mobile/video', 'app/video'
+        ]
+
+        for path in video_paths:
+            url = f"rtsp://{ip}:{port}/{path}"
+            try:
+                reader, writer = await asyncio.open_connection(ip, port)
+                writer.write(f"OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode())
+                await writer.drain()
+
+                try:
+                    data = await asyncio.wait_for(reader.read(1024), timeout=15.0)
+                    if b"RTSP/1.0 200" in data or b"RTSP/1.1 200" in data:
+                        # Track active stream
+                        self.active_streams[url] = {
+                            'first_seen': time.time(),
+                            'last_active': time.time(),
+                            'protocol': 'rtsp'
+                        }
+                        streams.append(url)
+                        logger.info(f"Found active RTSP video stream: {url}")
+                except asyncio.TimeoutError:
+                    logger.debug(f"RTSP timeout for {url}")
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+            except (ConnectionRefusedError, OSError) as e:
+                logger.debug(f"RTSP connection failed for {url}: {e}")
+                await asyncio.sleep(2)
+        return streams
+
+    async def check_hls(self, ip: str, port: int, session: aiohttp.ClientSession) -> List[str]:
+        """Check for active HLS video streams."""
+        streams = []
+        timeout = aiohttp.ClientTimeout(total=20.0)
+
+        video_paths = [
+            'video', 'live', 'stream', 'hls',
+            'channel1', 'channel2', 'media',
+            'mobile/video', 'app/video', 'live/hls'
+        ]
+
+        for path in video_paths:
+            variants = [f"{path}/index.m3u8", f"{path}/playlist.m3u8", f"{path}/master.m3u8"]
+            for variant in variants:
+                url = f"http://{ip}:{port}/{variant}"
+                try:
+                    async with session.get(url, timeout=timeout) as response:
+                        if response.status == 200:
+                            text = await response.text()
+                            # Verify it's an active HLS stream
+                            if '#EXTM3U' in text and ('#EXT-X-STREAM-INF' in text or '#EXTINF' in text):
+                                # Track active stream
+                                self.active_streams[url] = {
+                                    'first_seen': time.time(),
+                                    'last_active': time.time(),
+                                    'protocol': 'hls',
+                                    'segments': text.count('#EXTINF')
+                                }
+                                streams.append(url)
+                                logger.info(f"Found active HLS video stream: {url}")
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.debug(f"HLS check failed for {url}: {e}")
+                    await asyncio.sleep(2)
+        return streams

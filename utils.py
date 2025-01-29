@@ -12,10 +12,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Limit concurrent connections
-MAX_CONCURRENT_SCANS = 20
+MAX_CONCURRENT_SCANS = 5  # Reduced for mobile devices
 connection_semaphore = Semaphore(MAX_CONCURRENT_SCANS)
 
-async def check_port(ip: str, port: int, timeout: float = 2.0) -> bool:
+async def check_port(ip: str, port: int, timeout: float = 5.0) -> bool:
     """Check if a port is open on the given IP with connection limiting and retries."""
     async with connection_semaphore:
         for attempt in range(3):  # Try up to 3 times
@@ -30,16 +30,16 @@ async def check_port(ip: str, port: int, timeout: float = 2.0) -> bool:
             except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
                 logger.debug(f"Port {port} on {ip} check failed (attempt {attempt + 1}/3): {str(e)}")
                 if attempt < 2:  # Don't sleep after the last attempt
-                    await asyncio.sleep(1)  # Wait between retries
+                    await asyncio.sleep(2)  # Increased delay between retries
         return False
 
 async def probe_url(url: str, session: aiohttp.ClientSession) -> bool:
     """Probe a URL to check if it's a valid streaming endpoint with retries."""
     async with connection_semaphore:
-        for attempt in range(3):  # Try up to 3 times
+        for attempt in range(5):  # Increased retries to 5
             try:
                 # Try HEAD request first
-                timeout = aiohttp.ClientTimeout(total=5)
+                timeout = aiohttp.ClientTimeout(total=10)  # Increased timeout
                 async with session.head(url, timeout=timeout, allow_redirects=True) as response:
                     if response.status == 200:
                         content_type = response.headers.get('content-type', '')
@@ -60,20 +60,20 @@ async def probe_url(url: str, session: aiohttp.ClientSession) -> bool:
                                 return True
 
                         elif response.status != 404:  # If not 404, might be worth retrying
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(2)  # Increased delay
                             continue
                 return False
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.debug(f"Failed to probe URL {url} (attempt {attempt + 1}/3): {str(e)}")
-                if attempt < 2:  # Don't sleep after the last attempt
-                    await asyncio.sleep(1)  # Wait between retries
+                logger.debug(f"Failed to probe URL {url} (attempt {attempt + 1}/5): {str(e)}")
+                if attempt < 4:  # Don't sleep after the last attempt
+                    await asyncio.sleep(2)  # Increased delay between retries
         return False
 
 def get_local_ip() -> str:
     """Get the local IP address with improved error handling."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2.0)  # Increased timeout
+        sock.settimeout(5.0)  # Increased timeout
         sock.connect(("8.8.8.8", 80))
         local_ip = sock.getsockname()[0]
         sock.close()

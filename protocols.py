@@ -1,4 +1,4 @@
-"""Protocol definitions and detection logic for streaming URLs."""
+"""Protocol definitions and detection logic for video streaming URLs."""
 import re
 from typing import Dict, List, Optional
 import logging
@@ -8,71 +8,60 @@ logger = logging.getLogger(__name__)
 
 COMMON_STREAMING_PORTS = {
     'rtsp': [554, 8554],
-    'http': [80, 8080, 8000, 8800, 8888, 3000, 5000],  # Added more mobile-friendly ports
-    'https': [443, 8443, 4443],
-    'hls': [8081, 1935, 8082, 8083],
-    'rtmp': [1935, 1936, 1937],
-    'ws': [8084, 8085, 8086],  # WebSocket ports
-    'wss': [8443, 4443]  # Secure WebSocket ports
+    'http': [80, 8080, 8000, 8800, 8888],  # Common video streaming ports
+    'https': [443, 8443],
+    'hls': [8081, 1935],  # HLS specific ports
+    'rtmp': [1935, 1936]  # RTMP specific ports
 }
 
+# Video-focused streaming patterns
 STREAMING_PATTERNS = {
     'rtsp': re.compile(r'rtsp://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$'),
     'hls': re.compile(r'.*\.(m3u8|m3u)(\?.*)?$'),
     'dash': re.compile(r'.*\.mpd(\?.*)?$'),
     'rtmp': re.compile(r'rtmp://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$'),
-    'http_stream': re.compile(r'.*\.(ts|mp4|flv|m4s|webm|mkv|avi|mov|m3u8)(\?.*)?$'),
-    'adaptive_stream': re.compile(r'.*/manifest(\?.*)?$|.*/playlist(\?.*)?$|.*/stream(\?.*)?$|.*/live(\?.*)?$'),
-    'ws_stream': re.compile(r'ws://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$|wss://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$'),
-    'mobile_stream': re.compile(r'.*/mobile/stream(\?.*)?$|.*/mobile/live(\?.*)?$|.*/mobile/playlist(\?.*)?$')
+    'direct_video': re.compile(r'.*\.(mp4|ts|mkv|avi|mov)(\?.*)?$'),
+    'adaptive_video': re.compile(r'.*/manifest(\?.*)?$|.*/playlist(\?.*)?$|.*/stream(\?.*)?$|.*/live(\?.*)?$')
 }
 
-# Extended content types for video streams
+# Video-specific content types
 VIDEO_CONTENT_TYPES = [
-    'video/',
-    'application/x-mpegurl',
-    'application/vnd.apple.mpegurl',
-    'application/dash+xml',
-    'application/x-rtsp',
-    'application/x-rtmp',
-    'application/octet-stream',
-    'binary/octet-stream',
-    'application/x-flv',
+    'video/',  # Any video type
+    'application/x-mpegurl',  # HLS
+    'application/vnd.apple.mpegurl',  # HLS (Apple)
+    'application/dash+xml',  # DASH
+    'application/x-rtsp',  # RTSP
+    'application/x-rtmp',  # RTMP
     'video/mp4',
     'video/webm',
-    'video/x-matroska',
-    'video/quicktime',
-    'application/x-mpegURL',  # iOS HLS streams
-    'application/x-fcs',      # Flash Media Server
-    'application/x-shockwave-flash',
-    'application/vnd.apple.mpegurl',  # Apple HLS
-    'application/x-google-vlc-plugin',
-    'application/x-silverlight-app'
+    'video/x-matroska',  # MKV
+    'video/quicktime',  # MOV
+    'video/x-flv',  # FLV
+    'application/x-mpegURL'  # HLS variant
 ]
 
+# Video streaming protocol headers
 PROTOCOL_HEADERS = {
     'hls': b'#EXTM3U',
     'dash': b'<?xml',
     'rtsp': b'RTSP/1.0',
     'rtmp': b'<policy-file-request/>',
-    'adaptive': b'#EXT',
-    'ws': b'\x81',  # WebSocket binary frame
-    'mobile': b'#EXTM3U'  # Mobile HLS
+    'video': b'mdat'  # Common MP4 box marker
 }
 
 def is_streaming_url(url: str) -> bool:
-    """Check if a URL matches known streaming patterns."""
+    """Check if a URL matches known video streaming patterns."""
     for pattern in STREAMING_PATTERNS.values():
         if pattern.match(url):
             return True
     return False
 
 def get_protocol_ports() -> List[int]:
-    """Get a list of all common streaming ports."""
+    """Get a list of all common video streaming ports."""
     return list(set([port for ports in COMMON_STREAMING_PORTS.values() for port in ports]))
 
 def classify_url(url: str) -> str:
-    """Classify the streaming URL type with improved accuracy."""
+    """Classify the video streaming URL type."""
     for protocol, pattern in STREAMING_PATTERNS.items():
         if pattern.match(url):
             logger.debug(f"URL {url} classified as {protocol}")
@@ -85,10 +74,11 @@ def is_video_content_type(content_type: str) -> bool:
     return any(vct in content_type for vct in VIDEO_CONTENT_TYPES)
 
 def validate_protocol_response(data: bytes, protocol: str) -> bool:
-    """Validate protocol-specific response data."""
+    """Validate video protocol-specific response data."""
     if not data:
         return False
 
+    # Check for protocol-specific headers
     expected_header = PROTOCOL_HEADERS.get(protocol)
     if expected_header and expected_header in data[:len(expected_header)]:
         return True
@@ -97,35 +87,31 @@ def validate_protocol_response(data: bytes, protocol: str) -> bool:
     if protocol == 'rtsp':
         return b'RTSP/1.0' in data or b'RTSP/1.1' in data
     elif protocol == 'hls':
-        return (b'#EXTM3U' in data or b'#EXT-X-VERSION' in data or 
-                b'#EXT-X-STREAM-INF' in data)
+        return b'#EXTM3U' in data and (b'#EXT-X-STREAM-INF' in data or b'#EXTINF' in data)
     elif protocol == 'dash':
         return b'<?xml' in data and (b'MPD' in data or b'manifest' in data.lower())
     elif protocol == 'rtmp':
         return True  # RTMP validation is connection-based
-    elif protocol == 'ws':
-        return len(data) > 0  # Any data for WebSocket
-    elif protocol == 'adaptive':
-        return (b'#EXT' in data or b'BANDWIDTH' in data or 
-                b'RESOLUTION' in data or b'CODECS' in data)
 
     # Check for binary video content
-    return any(header in data[:1024] for header in [
-        b'ftyp', b'moov', b'mdat',  # MP4
-        b'webm', b'matroska',  # WebM/MKV
-        b'FLV'  # Flash Video
-    ])
+    video_signatures = [
+        b'ftyp',  # MP4 signature
+        b'moov',  # MP4 movie header
+        b'mdat',  # MP4 media data
+        b'webm',  # WebM signature
+        b'matroska',  # MKV signature
+        b'FLV'   # Flash Video signature
+    ]
+    return any(sig in data[:1024] for sig in video_signatures)
 
 def get_protocol_timeout(protocol: str) -> float:
-    """Get recommended timeout value for specific protocol."""
+    """Get recommended timeout value for specific video protocol."""
     timeouts = {
-        'rtsp': 8.0,    # Increased for mobile networks
-        'hls': 10.0,    # Increased for mobile networks
-        'dash': 10.0,   # Increased for mobile networks
-        'rtmp': 8.0,    # Increased for mobile networks
-        'http': 10.0,   # Increased for mobile networks
-        'https': 10.0,  # Increased for mobile networks
-        'ws': 8.0,      # WebSocket timeout
-        'wss': 8.0      # Secure WebSocket timeout
+        'rtsp': 15.0,    # Increased for mobile networks
+        'hls': 20.0,     # Increased for mobile networks
+        'dash': 20.0,    # Increased for mobile networks
+        'rtmp': 15.0,    # Increased for mobile networks
+        'http': 20.0,    # Increased for mobile networks
+        'https': 20.0    # Increased for mobile networks
     }
-    return timeouts.get(protocol, 5.0)  # Default increased to 5.0
+    return timeouts.get(protocol, 10.0)  # Default timeout

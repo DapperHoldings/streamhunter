@@ -8,10 +8,12 @@ logger = logging.getLogger(__name__)
 
 COMMON_STREAMING_PORTS = {
     'rtsp': [554, 8554],
-    'http': [80, 8080, 8000, 8800, 8888],  # Added more common HTTP ports
-    'https': [443, 8443],
-    'hls': [8081, 1935, 8082],
-    'rtmp': [1935, 1936]  # Added backup RTMP port
+    'http': [80, 8080, 8000, 8800, 8888, 3000, 5000],  # Added more mobile-friendly ports
+    'https': [443, 8443, 4443],
+    'hls': [8081, 1935, 8082, 8083],
+    'rtmp': [1935, 1936, 1937],
+    'ws': [8084, 8085, 8086],  # WebSocket ports
+    'wss': [8443, 4443]  # Secure WebSocket ports
 }
 
 STREAMING_PATTERNS = {
@@ -19,9 +21,10 @@ STREAMING_PATTERNS = {
     'hls': re.compile(r'.*\.(m3u8|m3u)(\?.*)?$'),
     'dash': re.compile(r'.*\.mpd(\?.*)?$'),
     'rtmp': re.compile(r'rtmp://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$'),
-    'http_stream': re.compile(r'.*\.(ts|mp4|flv|m4s|webm|mkv|avi|mov)(\?.*)?$'),
-    'adaptive_stream': re.compile(r'.*/manifest(\?.*)?$|.*/playlist(\?.*)?$|.*/stream(\?.*)?$'),
-    'ws_stream': re.compile(r'ws://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$|wss://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$')
+    'http_stream': re.compile(r'.*\.(ts|mp4|flv|m4s|webm|mkv|avi|mov|m3u8)(\?.*)?$'),
+    'adaptive_stream': re.compile(r'.*/manifest(\?.*)?$|.*/playlist(\?.*)?$|.*/stream(\?.*)?$|.*/live(\?.*)?$'),
+    'ws_stream': re.compile(r'ws://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$|wss://[^/]+(:\d+)?(/[^?]*)?(\?.*)?$'),
+    'mobile_stream': re.compile(r'.*/mobile/stream(\?.*)?$|.*/mobile/live(\?.*)?$|.*/mobile/playlist(\?.*)?$')
 }
 
 # Extended content types for video streams
@@ -32,13 +35,19 @@ VIDEO_CONTENT_TYPES = [
     'application/dash+xml',
     'application/x-rtsp',
     'application/x-rtmp',
-    'application/octet-stream',  # Some streams use this
+    'application/octet-stream',
     'binary/octet-stream',
     'application/x-flv',
     'video/mp4',
     'video/webm',
     'video/x-matroska',
-    'video/quicktime'
+    'video/quicktime',
+    'application/x-mpegURL',  # iOS HLS streams
+    'application/x-fcs',      # Flash Media Server
+    'application/x-shockwave-flash',
+    'application/vnd.apple.mpegurl',  # Apple HLS
+    'application/x-google-vlc-plugin',
+    'application/x-silverlight-app'
 ]
 
 PROTOCOL_HEADERS = {
@@ -46,7 +55,9 @@ PROTOCOL_HEADERS = {
     'dash': b'<?xml',
     'rtsp': b'RTSP/1.0',
     'rtmp': b'<policy-file-request/>',
-    'adaptive': b'#EXT'  # For adaptive streaming formats
+    'adaptive': b'#EXT',
+    'ws': b'\x81',  # WebSocket binary frame
+    'mobile': b'#EXTM3U'  # Mobile HLS
 }
 
 def is_streaming_url(url: str) -> bool:
@@ -92,22 +103,29 @@ def validate_protocol_response(data: bytes, protocol: str) -> bool:
         return b'<?xml' in data and (b'MPD' in data or b'manifest' in data.lower())
     elif protocol == 'rtmp':
         return True  # RTMP validation is connection-based
+    elif protocol == 'ws':
+        return len(data) > 0  # Any data for WebSocket
     elif protocol == 'adaptive':
         return (b'#EXT' in data or b'BANDWIDTH' in data or 
                 b'RESOLUTION' in data or b'CODECS' in data)
 
     # Check for binary video content
-    return any(header in data[:1024] for header in [b'ftyp', b'moov', b'mdat'])
+    return any(header in data[:1024] for header in [
+        b'ftyp', b'moov', b'mdat',  # MP4
+        b'webm', b'matroska',  # WebM/MKV
+        b'FLV'  # Flash Video
+    ])
 
 def get_protocol_timeout(protocol: str) -> float:
     """Get recommended timeout value for specific protocol."""
     timeouts = {
-        'rtsp': 5.0,
-        'hls': 8.0,
-        'dash': 8.0,
-        'rtmp': 5.0,
-        'http': 8.0,
-        'https': 8.0,
-        'ws': 5.0
+        'rtsp': 8.0,    # Increased for mobile networks
+        'hls': 10.0,    # Increased for mobile networks
+        'dash': 10.0,   # Increased for mobile networks
+        'rtmp': 8.0,    # Increased for mobile networks
+        'http': 10.0,   # Increased for mobile networks
+        'https': 10.0,  # Increased for mobile networks
+        'ws': 8.0,      # WebSocket timeout
+        'wss': 8.0      # Secure WebSocket timeout
     }
-    return timeouts.get(protocol, 2.0)
+    return timeouts.get(protocol, 5.0)  # Default increased to 5.0

@@ -10,52 +10,50 @@ from protocols import (
 from utils import check_port, probe_url, get_network_range
 from asyncio import Semaphore
 import time
-import websockets
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class StreamScanner:
-    def __init__(self, max_concurrent_hosts: int = 5):  # Reduced for mobile devices
+    def __init__(self, max_concurrent_hosts: int = 30):  # Increased concurrent hosts
         self.discovered_streams: Set[str] = set()
-        self.active_streams: Dict[str, Dict] = {}  # Track active streams
+        self.active_streams: Dict[str, Dict] = {}
         self.scan_count = 0
         self.total_hosts = 0
         self.host_semaphore = Semaphore(max_concurrent_hosts)
-        self.session_timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+        self.session_timeout = aiohttp.ClientTimeout(total=120)  # Reduced timeout
         self.successful_scans = 0
         self.failed_scans = 0
-        self.retry_count = 5  # Increased retries
+        self.retry_count = 3  # Reduced retries
+        print("\033[92m=== Video Stream Scanner Started ===\033[0m")
 
     async def verify_active_stream(self, url: str, session: aiohttp.ClientSession) -> bool:
         """Verify if a stream is currently active by checking for video content."""
         try:
-            # Try multiple times with increased timeout
-            for attempt in range(3):
-                try:
-                    timeout = aiohttp.ClientTimeout(total=20)  # Increased timeout for mobile networks
-                    async with session.get(url, timeout=timeout) as response:
-                        if response.status == 200:
-                            # Read larger initial chunk to verify video content
-                            chunk = await response.content.read(16384)  # Increased chunk size
-                            content_type = response.headers.get('content-type', '')
+            timeout = aiohttp.ClientTimeout(total=5)  # Reduced timeout
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 200:
+                    chunk = await response.content.read(4096)  # Reduced chunk size
+                    content_type = response.headers.get('content-type', '')
 
-                            # Check both content type and data for video signatures
-                            if is_video_content_type(content_type) or validate_protocol_response(chunk, 'video'):
-                                # Save stream metadata with more details
-                                self.active_streams[url] = {
-                                    'first_seen': time.time(),
-                                    'last_active': time.time(),
-                                    'content_type': content_type,
-                                    'size': len(chunk),
-                                    'headers': dict(response.headers),
-                                    'status': 'active'
-                                }
-                                return True
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    logger.debug(f"Attempt {attempt + 1} failed for {url}: {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(2)
+                    if is_video_content_type(content_type) or validate_protocol_response(chunk, 'video'):
+                        print("\n" + "🎥 "*20)  # More visible border
+                        print("\033[93m🎥 ACTIVE STREAM DETECTED! 🎥\033[0m")
+                        print("\033[92m" + "="*50 + "\033[0m")  # Green separator
+                        print("Stream Details:")
+                        print(f"📌 URL: \033[96m{url}\033[0m")  # Cyan color for URL
+                        print(f"📋 Content-Type: {content_type}")
+                        print(f"📊 Initial Data Size: {len(chunk)} bytes")
+                        print("\033[92m" + "="*50 + "\033[0m")  # Green separator
+                        print("🎥 "*20 + "\n")  # More visible border
+
+                        self.active_streams[url] = {
+                            'first_seen': time.time(),
+                            'last_active': time.time(),
+                            'content_type': content_type,
+                            'size': len(chunk)
+                        }
+                        return True
         except Exception as e:
             logger.debug(f"Error verifying stream {url}: {e}")
         return False
@@ -63,24 +61,45 @@ class StreamScanner:
     async def scan_mobile_ports(self, ip: str, session: aiohttp.ClientSession) -> List[str]:
         """Scan ports commonly used by mobile streaming apps."""
         mobile_streams = []
-        mobile_ports = [8080, 8000, 8888, 9000, 8081, 8082, 8083, 8084, 8085]  # Extended mobile ports
+        mobile_ports = [8080, 8000, 8888, 9000, 9001, 9002]  # Extended mobile ports
         mobile_paths = [
+            # Basic paths
+            'stream', 'live', 'video',
+            # Mobile app specific paths
             'mobile/stream', 'mobile/live', 'mobile/video',
             'app/stream', 'app/live', 'app/video',
-            'stream/mobile', 'live/mobile', 'video/mobile',
-            'm/stream', 'm/live', 'm/video',
+            # Popular streaming app paths
+            'tiktok/live', 'tiktok/stream',
+            'rewatch/live', 'rewatch/stream',
+            'livestream', 'live_stream',
+            'mobile_stream', 'app_stream',
+            # Common mobile streaming paths
             'streaming', 'streams', 'videos',
-            'cast', 'casting', 'screen'
+            'cast', 'casting', 'screen',
+            'mobile/cast', 'app/cast',
+            # Additional mobile paths
+            'mobile', 'app', 'live',
+            'broadcast', 'webcast',
+            'mobile/broadcast', 'app/broadcast',
+            # Also check root path
+            ''
         ]
 
         for port in mobile_ports:
-            if await check_port(ip, port, timeout=5.0):
+            if await check_port(ip, port, timeout=2.0):  # Reduced timeout for faster scanning
                 for path in mobile_paths:
                     for protocol in ['http', 'https']:
                         url = f"{protocol}://{ip}:{port}/{path}"
                         if await self.verify_active_stream(url, session):
                             mobile_streams.append(url)
-                            logger.info(f"Found mobile stream: {url}")
+                            print("\n" + "📱 "*20)  # More visible border
+                            print("\033[96m📱 MOBILE STREAM DISCOVERED! 📱\033[0m")
+                            print("\033[92m" + "="*50 + "\033[0m")  # Green separator
+                            print("Mobile Stream Details:")
+                            print(f"📌 URL: \033[93m{url}\033[0m")  # Yellow color for URL
+                            print(f"📱 App Type: {path.split('/')[0] if '/' in path else 'Generic'}")
+                            print("\033[92m" + "="*50 + "\033[0m")  # Green separator
+                            print("📱 "*20 + "\n")  # More visible border
 
         return mobile_streams
 
@@ -91,17 +110,19 @@ class StreamScanner:
                 all_streams = []
 
                 # First check mobile streaming
+                print(f"\r\033[K🔍 Checking {ip} for mobile streams...")
                 mobile_streams = await self.scan_mobile_ports(ip, session)
                 if mobile_streams:
                     all_streams.extend(mobile_streams)
                     self.successful_scans += 1
+                    print(f"\033[92m✓ Found {len(mobile_streams)} streams on {ip}\033[0m")
 
                 # Then check standard protocols
                 for protocol, ports in COMMON_STREAMING_PORTS.items():
                     for port in ports:
-                        await asyncio.sleep(1)  # Rate limiting
                         try:
-                            if await check_port(ip, port, timeout=5.0):
+                            if await check_port(ip, port, timeout=3.0):  # Reduced timeout
+                                print(f"\r\033[K🔍 Checking {protocol.upper()} on {ip}:{port}...")
                                 streams = []
                                 if protocol == 'rtsp':
                                     streams = await self.check_rtsp(ip, port)
@@ -110,7 +131,7 @@ class StreamScanner:
                                 elif protocol == 'rtmp':
                                     continue  # Skip RTMP for now
                                 elif protocol in ['http', 'https']:
-                                    video_paths = ['video', 'stream', 'live', 'content']
+                                    video_paths = ['video', 'stream', 'live', 'content', '']
                                     for path in video_paths:
                                         url = f"{protocol}://{ip}:{port}/{path}"
                                         if await self.verify_active_stream(url, session):
@@ -119,12 +140,13 @@ class StreamScanner:
                                 if streams:
                                     all_streams.extend(streams)
                                     self.successful_scans += 1
+
                         except Exception as e:
-                            logger.error(f"Error checking {protocol} on {ip}:{port}: {e}")
-                            continue
+                            logger.debug(f"Error checking {protocol} on {ip}:{port}: {e}")
 
                 if all_streams:
                     self.discovered_streams.update(all_streams)
+                    print(f"\n\033[92m=== Found {len(all_streams)} streams on {ip} ===\033[0m")
 
         except Exception as e:
             logger.error(f"Error scanning host {ip}: {e}")
@@ -136,8 +158,18 @@ class StreamScanner:
     def _print_progress(self) -> None:
         """Print scan progress with success/failure stats."""
         progress = (self.scan_count / self.total_hosts) * 100
-        print(f"\rScanning progress: {progress:.1f}% ({self.scan_count}/{self.total_hosts}) "
-              f"[Success: {self.successful_scans}, Failed: {self.failed_scans}]", end="")
+        status = f"\r\033[K🔍 Scanning progress: {progress:.1f}% ({self.scan_count}/{self.total_hosts}) "
+        stats = f"[\033[92m✓ Found: {self.successful_scans}\033[0m, \033[91m✗ Failed: {self.failed_scans}\033[0m]"
+        print(f"{status}{stats}", end="", flush=True)
+
+        # Add additional feedback for long-running scans
+        if self.scan_count % 10 == 0:  # Show activity indicator every 10 hosts
+            try:
+                network_range = get_network_range()
+                current_ip = network_range[self.scan_count -1] #Corrected index
+                print(f"\n\033[K🔍 Currently scanning: {current_ip} for mobile streams...", end="", flush=True)
+            except (IndexError, ValueError) as e:
+                logger.debug(f"Error getting current IP: {e}")
 
     async def scan_network(self) -> Set[str]:
         """Scan the local network for active video streaming URLs."""
@@ -148,15 +180,30 @@ class StreamScanner:
             logger.error("No valid network range found")
             return set()
 
+        print("\033[95m=== Starting Network Scan ===\033[0m")  # Purple text
+        print(f"Scanning {self.total_hosts} hosts for video streams...")
+        print("\033[93mLooking for mobile streaming apps (TikTok, Rewatch Live, etc)...\033[0m")
+
         async with aiohttp.ClientSession(timeout=self.session_timeout) as session:
             tasks = []
             for ip in network_range:
                 task = asyncio.create_task(self.scan_host(ip, session))
                 tasks.append(task)
-                await asyncio.sleep(0.5)  # Rate limiting
+                await asyncio.sleep(0.1)  # Reduced delay for faster scanning
 
             await asyncio.gather(*tasks)
-            print("\nScan completed!")
+            print("\n" + "="*80)
+            print("\033[92m=== Scan Completed! ===\033[0m")
+            if self.discovered_streams:
+                print("\n\033[93mAll Discovered Streams:\033[0m")
+                print("-"*80)
+                print("Copy and paste any URL below to use it:")
+                for url in sorted(self.discovered_streams):
+                    print(f"\033[96m{url}\033[0m")  # Cyan color for URLs
+                print("-"*80)
+                print(f"Total streams found: {len(self.discovered_streams)}")
+            else:
+                print("\n\033[91mNo streams found. Make sure streaming apps are running.\033[0m")
 
         return self.discovered_streams
 

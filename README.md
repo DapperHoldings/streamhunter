@@ -32,7 +32,7 @@ pip install aiohttp requests
 
 4. Download the scanner files:
 ```bash
-curl -O https://raw.githubusercontent.com/yourusername/network-scanner/main/{main.py,scanner.py,protocols.py,utils.py}
+git clone https://github.com/DapperHoldings/streamhunter.git
 ```
 
 ## Usage

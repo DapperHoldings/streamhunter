@@ -6,49 +6,74 @@ from typing import List, Set
 import aiohttp
 import logging
 from asyncio import Semaphore
+from protocols import is_video_content_type
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Limit concurrent connections
-MAX_CONCURRENT_SCANS = 50
+MAX_CONCURRENT_SCANS = 20
 connection_semaphore = Semaphore(MAX_CONCURRENT_SCANS)
 
-async def check_port(ip: str, port: int, timeout: float = 1.0) -> bool:
-    """Check if a port is open on the given IP with connection limiting."""
+async def check_port(ip: str, port: int, timeout: float = 2.0) -> bool:
+    """Check if a port is open on the given IP with connection limiting and retries."""
     async with connection_semaphore:
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port),
-                timeout=timeout
-            )
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
-            logger.debug(f"Port {port} on {ip} is closed or unreachable: {str(e)}")
-            return False
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port),
+                    timeout=timeout
+                )
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
+                logger.debug(f"Port {port} on {ip} check failed (attempt {attempt + 1}/3): {str(e)}")
+                if attempt < 2:  # Don't sleep after the last attempt
+                    await asyncio.sleep(1)  # Wait between retries
+        return False
 
 async def probe_url(url: str, session: aiohttp.ClientSession) -> bool:
-    """Probe a URL to check if it's a valid streaming endpoint with connection limiting."""
+    """Probe a URL to check if it's a valid streaming endpoint with retries."""
     async with connection_semaphore:
-        try:
-            timeout = aiohttp.ClientTimeout(total=2)
-            async with session.head(url, timeout=timeout, allow_redirects=True) as response:
-                if response.status == 200:
-                    content_type = response.headers.get('content-type', '')
-                    return any(media_type in content_type.lower() 
-                             for media_type in ['video', 'stream', 'mpegurl', 'application'])
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                # Try HEAD request first
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with session.head(url, timeout=timeout, allow_redirects=True) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('content-type', '')
+                        if is_video_content_type(content_type):
+                            return True
+
+                # If HEAD doesn't work, try GET for the first few bytes
+                if response.status != 404:  # Skip if definitely not found
+                    async with session.get(url, timeout=timeout) as response:
+                        if response.status == 200:
+                            # Read first chunk to check content
+                            data = await response.content.read(1024)
+                            content_type = response.headers.get('content-type', '')
+
+                            # Check for video content type or binary signatures
+                            if (is_video_content_type(content_type) or
+                                any(sig in data for sig in [b'ftyp', b'moov', b'#EXT', b'<?xml'])):
+                                return True
+
+                        elif response.status != 404:  # If not 404, might be worth retrying
+                            await asyncio.sleep(1)
+                            continue
                 return False
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.debug(f"Failed to probe URL {url}: {str(e)}")
-            return False
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.debug(f"Failed to probe URL {url} (attempt {attempt + 1}/3): {str(e)}")
+                if attempt < 2:  # Don't sleep after the last attempt
+                    await asyncio.sleep(1)  # Wait between retries
+        return False
 
 def get_local_ip() -> str:
     """Get the local IP address with improved error handling."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1.0)
+        sock.settimeout(2.0)  # Increased timeout
         sock.connect(("8.8.8.8", 80))
         local_ip = sock.getsockname()[0]
         sock.close()

@@ -11,97 +11,127 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class StreamScanner:
-    def __init__(self, max_concurrent_hosts: int = 50):
+    def __init__(self, max_concurrent_hosts: int = 20):
         self.discovered_streams: Set[str] = set()
         self.scan_count = 0
         self.total_hosts = 0
         self.host_semaphore = Semaphore(max_concurrent_hosts)
-        self.session_timeout = aiohttp.ClientTimeout(total=30)
+        self.session_timeout = aiohttp.ClientTimeout(total=60)
         self.successful_scans = 0
         self.failed_scans = 0
+        self.retry_count = 3
         self.protocol_timeouts = {
-            'rtsp': 2.0,
-            'hls': 3.0,
-            'dash': 3.0,
-            'rtmp': 2.0,
-            'http': 3.0,
-            'https': 3.0
+            'rtsp': 5.0,
+            'hls': 8.0,
+            'dash': 8.0,
+            'rtmp': 5.0,
+            'http': 8.0,
+            'https': 8.0
         }
 
     async def check_rtsp(self, ip: str, port: int) -> List[str]:
-        """Check for RTSP streams on the given IP and port."""
+        """Check for RTSP streams on the given IP and port with retries."""
         streams = []
-        common_paths = ['live', 'stream', 'cam', 'video0', 'h264']
+        common_paths = [
+            'live', 'stream', 'cam', 'video0', 'video1', 'h264', 'mpeg4',
+            'media', 'videoMain', 'video1+audio1', 'primary', 'track1',
+            'ch01', 'ch1', 'sub', 'main', 'av0_0', 'av0_1', 'streaming'
+        ]
         timeout = self.protocol_timeouts['rtsp']
 
         for path in common_paths:
             url = f"rtsp://{ip}:{port}/{path}"
-            try:
-                reader, writer = await asyncio.open_connection(ip, port)
-                writer.write(f"OPTIONS {url} RTSP/1.0\r\n\r\n".encode())
-                await writer.drain()
-
+            for attempt in range(self.retry_count):
                 try:
-                    data = await asyncio.wait_for(reader.read(1024), timeout=timeout)
-                    if b"RTSP/1.0 200" in data:
-                        streams.append(url)
-                        logger.info(f"Found RTSP stream: {url}")
-                except asyncio.TimeoutError:
-                    logger.debug(f"RTSP timeout for {url}")
-                finally:
-                    writer.close()
-                    await writer.wait_closed()
-            except (ConnectionRefusedError, OSError) as e:
-                logger.debug(f"RTSP connection failed for {url}: {e}")
+                    reader, writer = await asyncio.open_connection(ip, port)
+                    writer.write(f"OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode())
+                    await writer.drain()
+
+                    try:
+                        data = await asyncio.wait_for(reader.read(1024), timeout=timeout)
+                        if b"RTSP/1.0 200" in data or b"RTSP/1.1 200" in data:
+                            streams.append(url)
+                            logger.info(f"Found RTSP stream: {url}")
+                            break
+                    except asyncio.TimeoutError:
+                        logger.debug(f"RTSP timeout for {url} (attempt {attempt + 1}/{self.retry_count})")
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+                        await asyncio.sleep(1)  # Add delay between retries
+                except (ConnectionRefusedError, OSError) as e:
+                    logger.debug(f"RTSP connection failed for {url}: {e}")
+                    await asyncio.sleep(1)  # Add delay between retries
         return streams
 
     async def check_hls(self, ip: str, port: int, session: aiohttp.ClientSession) -> List[str]:
-        """Check for HLS streams on the given IP and port."""
+        """Check for HLS streams on the given IP and port with retries."""
         streams = []
-        paths = ['hls', 'live', 'stream']
+        paths = [
+            'hls', 'live', 'stream', 'streaming', 'playlist', 'channel',
+            'live/stream', 'live/channel1', 'video', 'media', 'content',
+            'stream1', 'stream2', 'ch1', 'ch2', 'feed1', 'feed2'
+        ]
         timeout = aiohttp.ClientTimeout(total=self.protocol_timeouts['hls'])
 
         for path in paths:
-            url = f"http://{ip}:{port}/{path}/index.m3u8"
-            try:
-                async with session.get(url, timeout=timeout) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                        if '#EXTM3U' in text:
-                            streams.append(url)
-                            logger.info(f"Found HLS stream: {url}")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.debug(f"HLS check failed for {url}: {e}")
+            variants = [f"{path}/index.m3u8", f"{path}/playlist.m3u8", f"{path}/master.m3u8"]
+            for variant in variants:
+                url = f"http://{ip}:{port}/{variant}"
+                for attempt in range(self.retry_count):
+                    try:
+                        async with session.get(url, timeout=timeout) as response:
+                            if response.status == 200:
+                                text = await response.text()
+                                if '#EXTM3U' in text:
+                                    streams.append(url)
+                                    logger.info(f"Found HLS stream: {url}")
+                                    break
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logger.debug(f"HLS check failed for {url}: {e}")
+                        await asyncio.sleep(1)  # Add delay between retries
         return streams
 
     async def check_dash(self, ip: str, port: int, session: aiohttp.ClientSession) -> List[str]:
-        """Check for DASH streams on the given IP and port."""
+        """Check for DASH streams on the given IP and port with retries."""
         streams = []
-        paths = ['dash', 'stream', 'live']
+        paths = [
+            'dash', 'stream', 'live', 'content', 'media', 'channel',
+            'video', 'streaming', 'manifest', 'mpd', 'output'
+        ]
         timeout = aiohttp.ClientTimeout(total=self.protocol_timeouts['dash'])
 
         for path in paths:
-            url = f"http://{ip}:{port}/{path}/manifest.mpd"
-            try:
-                async with session.get(url, timeout=timeout) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                        if '<MPD' in text:
-                            streams.append(url)
-                            logger.info(f"Found DASH stream: {url}")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.debug(f"DASH check failed for {url}: {e}")
+            variants = [f"{path}/manifest.mpd", f"{path}/stream.mpd", f"{path}/index.mpd"]
+            for variant in variants:
+                url = f"http://{ip}:{port}/{variant}"
+                for attempt in range(self.retry_count):
+                    try:
+                        async with session.get(url, timeout=timeout) as response:
+                            if response.status == 200:
+                                text = await response.text()
+                                if '<MPD' in text:
+                                    streams.append(url)
+                                    logger.info(f"Found DASH stream: {url}")
+                                    break
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logger.debug(f"DASH check failed for {url}: {e}")
+                        await asyncio.sleep(1)  # Add delay between retries
         return streams
 
     async def check_rtmp(self, ip: str, port: int) -> List[str]:
-        """Check for RTMP streams on the given IP and port."""
+        """Check for RTMP streams on the given IP and port with retries."""
         streams = []
-        if await check_port(ip, port):
-            paths = ['live', 'stream', 'app']
+        if await check_port(ip, port, timeout=self.protocol_timeouts['rtmp']):
+            paths = [
+                'live', 'stream', 'app', 'broadcast', 'channel',
+                'streaming', 'live/stream', 'media', 'content'
+            ]
             for path in paths:
                 url = f"rtmp://{ip}:{port}/{path}"
                 streams.append(url)
                 logger.info(f"Found potential RTMP endpoint: {url}")
+                await asyncio.sleep(0.5)  # Add small delay between checks
         return streams
 
     async def scan_host(self, ip: str, session: aiohttp.ClientSession) -> None:
@@ -112,7 +142,9 @@ class StreamScanner:
 
                 for protocol, ports in COMMON_STREAMING_PORTS.items():
                     for port in ports:
-                        if await check_port(ip, port):
+                        # Add delay between port checks
+                        await asyncio.sleep(0.2)
+                        if await check_port(ip, port, timeout=2.0):
                             if protocol == 'rtsp':
                                 task = self.check_rtsp(ip, port)
                             elif protocol == 'hls':
@@ -120,7 +152,7 @@ class StreamScanner:
                             elif protocol == 'rtmp':
                                 task = self.check_rtmp(ip, port)
                             else:  # HTTP/HTTPS
-                                paths = ['stream', 'live', 'hls', 'dash']
+                                paths = ['stream', 'live', 'hls', 'dash', 'channel', 'video']
                                 task = asyncio.gather(*[
                                     probe_url(f"{protocol}://{ip}:{port}/{path}", session)
                                     for path in paths
